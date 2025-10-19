@@ -1,0 +1,587 @@
+/*
+ * Sound Capture Device - Designed By Albert Hycentte
+ * ESP32-S3 with INMP441 Microphone and MAX98357A Amplifier
+ * Features: Record, Play, Stop with SD card storage
+ * 
+ * Hardware Configuration:
+ * - Microphone: INMP441 (I2S Input on GPIO36, 37, 38)
+ * - Amplifier: MAX98357A (I2S Output on GPIO4, 5, 9)
+ * - SD Card: SPI mode (GPIO10, 11, 12, 13)
+ * - Buttons: Start (GPIO7), Stop (GPIO8), Play (GPIO1)
+ * - Status LED: GPIO6
+ * - Amplifier Enable: GPIO3
+ */
+
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include <SD.h>
+#include <SPI.h>
+
+// ===== GPIO Pin Definitions =====
+// I2S Input (INMP441 Microphone)
+#define I2S_MIC_WS          36
+#define I2S_MIC_SD          37
+#define I2S_MIC_SCK         38
+
+// I2S Output (MAX98357A Amplifier)
+#define I2S_SPK_BCLK        4
+#define I2S_SPK_DIN         5
+#define I2S_SPK_LRCLK       9
+#define I2S_SPK_SD_MODE     3  // Amplifier enable/disable
+
+// SD Card (SPI Mode)
+#define SD_CS               10
+#define SD_CMD              11  // MOSI
+#define SD_CLK              12  // SCK
+#define SD_DAT0             13  // MISO
+
+// User Interface
+#define BTN_START           7
+#define BTN_STOP            8
+#define BTN_PLAY            1
+#define LED_STATUS          6
+
+// ===== Audio Configuration =====
+#define SAMPLE_RATE         16000  // 16kHz for voice recording
+#define SAMPLE_BITS         16
+#define I2S_CHANNELS        1      // Mono
+#define DMA_BUF_COUNT       8
+#define DMA_BUF_LEN         512
+#define RECORD_TIME_MS      60000  // Max 60 seconds per recording
+#define WAV_HEADER_SIZE     44
+
+// ===== I2S Port Definitions =====
+#define I2S_MIC_PORT        I2S_NUM_0  // Input from microphone
+#define I2S_SPK_PORT        I2S_NUM_1  // Output to speaker
+
+// ===== Device States =====
+enum DeviceState {
+  STATE_IDLE,
+  STATE_RECORDING,
+  STATE_PLAYING,
+  STATE_ERROR
+};
+
+// ===== Global Variables =====
+DeviceState currentState = STATE_IDLE;
+File audioFile;
+String currentFileName = "";
+uint32_t recordingNumber = 1;
+unsigned long recordStartTime = 0;
+bool sdCardReady = false;
+
+// Audio buffers
+int16_t* audioBuffer = nullptr;
+const size_t BUFFER_SIZE = DMA_BUF_LEN * 4;
+
+// ===== WAV File Header Structure =====
+struct WAVHeader {
+  // RIFF Chunk
+  char riff[4] = {'R', 'I', 'F', 'F'};
+  uint32_t fileSize;
+  char wave[4] = {'W', 'A', 'V', 'E'};
+  
+  // Format Chunk
+  char fmt[4] = {'f', 'm', 't', ' '};
+  uint32_t fmtSize = 16;
+  uint16_t audioFormat = 1;  // PCM
+  uint16_t numChannels = I2S_CHANNELS;
+  uint32_t sampleRate = SAMPLE_RATE;
+  uint32_t byteRate;
+  uint16_t blockAlign;
+  uint16_t bitsPerSample = SAMPLE_BITS;
+  
+  // Data Chunk
+  char data[4] = {'d', 'a', 't', 'a'};
+  uint32_t dataSize;
+};
+
+// ===== Function Prototypes =====
+void setupI2SMicrophone();
+void setupI2SSpeaker();
+void shutdownI2SSpeaker();
+void setupSDCard();
+void setupButtons();
+void setupLED();
+void ledBlink(int times, int delayMs);
+void ledOn();
+void ledOff();
+void startRecording();
+void stopRecording();
+void startPlayback();
+void stopPlayback();
+void recordAudioTask();
+void playAudioTask();
+void writeWAVHeader(File& file, uint32_t dataSize);
+void handleButtons();
+void printError(const char* message);
+
+// ===== Setup Function =====
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n=== Sound Capture Device ===");
+  Serial.println("Initializing...");
+  
+  // Initialize LED first for status indication
+  setupLED();
+  ledBlink(2, 200);  // Startup indication
+  
+  // Allocate audio buffer
+  audioBuffer = (int16_t*)malloc(BUFFER_SIZE * sizeof(int16_t));
+  if (!audioBuffer) {
+    printError("Failed to allocate audio buffer");
+    currentState = STATE_ERROR;
+    return;
+  }
+  
+  // Initialize peripherals
+  setupButtons();
+  setupSDCard();
+  setupI2SMicrophone();
+  
+  // Keep speaker amplifier off initially (save power)
+  pinMode(I2S_SPK_SD_MODE, OUTPUT);
+  digitalWrite(I2S_SPK_SD_MODE, LOW);
+  
+  if (sdCardReady) {
+    Serial.println("System ready!");
+    ledBlink(3, 100);  // Ready indication
+    currentState = STATE_IDLE;
+  } else {
+    printError("SD Card not ready");
+    currentState = STATE_ERROR;
+  }
+}
+
+// ===== Main Loop =====
+void loop() {
+  handleButtons();
+  
+  switch (currentState) {
+    case STATE_IDLE:
+      ledOff();
+      delay(50);
+      break;
+      
+    case STATE_RECORDING:
+      ledOn();
+      recordAudioTask();
+      
+      // Auto-stop after max recording time
+      if (millis() - recordStartTime > RECORD_TIME_MS) {
+        Serial.println("Max recording time reached");
+        stopRecording();
+      }
+      break;
+      
+    case STATE_PLAYING:
+      ledBlink(1, 500);  // Blink while playing
+      playAudioTask();
+      break;
+      
+    case STATE_ERROR:
+      ledBlink(5, 100);  // Rapid blink for error
+      delay(2000);
+      break;
+  }
+}
+
+// ===== I2S Microphone Setup =====
+void setupI2SMicrophone() {
+  Serial.println("Configuring I2S microphone...");
+  
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = DMA_BUF_COUNT,
+    .dma_buf_len = DMA_BUF_LEN,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+  
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_MIC_SCK,
+    .ws_io_num = I2S_MIC_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_MIC_SD
+  };
+  
+  esp_err_t err = i2s_driver_install(I2S_MIC_PORT, &i2s_config, 0, NULL);
+  if (err != ESP_OK) {
+    printError("Failed to install I2S mic driver");
+    return;
+  }
+  
+  err = i2s_set_pin(I2S_MIC_PORT, &pin_config);
+  if (err != ESP_OK) {
+    printError("Failed to set I2S mic pins");
+    return;
+  }
+  
+  Serial.println("I2S microphone ready");
+}
+
+// ===== I2S Speaker Setup =====
+void setupI2SSpeaker() {
+  Serial.println("Configuring I2S speaker...");
+  
+  // Enable amplifier
+  digitalWrite(I2S_SPK_SD_MODE, HIGH);
+  delay(50);  // Give amplifier time to power up
+  
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = DMA_BUF_COUNT,
+    .dma_buf_len = DMA_BUF_LEN,
+    .use_apll = false,
+    .tx_desc_auto_clear = true,
+    .fixed_mclk = 0
+  };
+  
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SPK_BCLK,
+    .ws_io_num = I2S_SPK_LRCLK,
+    .data_out_num = I2S_SPK_DIN,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
+  
+  esp_err_t err = i2s_driver_install(I2S_SPK_PORT, &i2s_config, 0, NULL);
+  if (err != ESP_OK) {
+    printError("Failed to install I2S speaker driver");
+    return;
+  }
+  
+  err = i2s_set_pin(I2S_SPK_PORT, &pin_config);
+  if (err != ESP_OK) {
+    printError("Failed to set I2S speaker pins");
+    return;
+  }
+  
+  // Set volume by clearing any previous data
+  i2s_zero_dma_buffer(I2S_SPK_PORT);
+  
+  Serial.println("I2S speaker ready");
+}
+
+// ===== Shutdown Speaker =====
+void shutdownI2SSpeaker() {
+  i2s_driver_uninstall(I2S_SPK_PORT);
+  digitalWrite(I2S_SPK_SD_MODE, LOW);  // Disable amplifier (save power)
+  Serial.println("Speaker shut down");
+}
+
+// ===== SD Card Setup =====
+void setupSDCard() {
+  Serial.println("Initializing SD card...");
+  
+  SPI.begin(SD_CLK, SD_DAT0, SD_CMD, SD_CS);
+  
+  if (!SD.begin(SD_CS, SPI, 25000000)) {
+    printError("SD card mount failed");
+    sdCardReady = false;
+    return;
+  }
+  
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    printError("No SD card attached");
+    sdCardReady = false;
+    return;
+  }
+  
+  Serial.print("SD Card Type: ");
+  if (cardType == CARD_MMC) Serial.println("MMC");
+  else if (cardType == CARD_SD) Serial.println("SDSC");
+  else if (cardType == CARD_SDHC) Serial.println("SDHC");
+  else Serial.println("UNKNOWN");
+  
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  Serial.printf("SD Card Size: %lluMB\n", cardSize);
+  
+  // Create recordings directory
+  if (!SD.exists("/recordings")) {
+    SD.mkdir("/recordings");
+  }
+  
+  // Find next recording number
+  File root = SD.open("/recordings");
+  while (File file = root.openNextFile()) {
+    String name = file.name();
+    if (name.startsWith("rec_") && name.endsWith(".wav")) {
+      int num = name.substring(4, name.length() - 4).toInt();
+      if (num >= recordingNumber) {
+        recordingNumber = num + 1;
+      }
+    }
+    file.close();
+  }
+  root.close();
+  
+  sdCardReady = true;
+  Serial.println("SD card ready");
+}
+
+// ===== Button Setup =====
+void setupButtons() {
+  pinMode(BTN_START, INPUT_PULLUP);
+  pinMode(BTN_STOP, INPUT_PULLUP);
+  pinMode(BTN_PLAY, INPUT_PULLUP);
+  Serial.println("Buttons configured");
+}
+
+// ===== LED Functions =====
+void setupLED() {
+  pinMode(LED_STATUS, OUTPUT);
+  digitalWrite(LED_STATUS, LOW);
+}
+
+void ledOn() {
+  digitalWrite(LED_STATUS, HIGH);
+}
+
+void ledOff() {
+  digitalWrite(LED_STATUS, LOW);
+}
+
+void ledBlink(int times, int delayMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_STATUS, HIGH);
+    delay(delayMs);
+    digitalWrite(LED_STATUS, LOW);
+    delay(delayMs);
+  }
+}
+
+// ===== Start Recording =====
+void startRecording() {
+  if (!sdCardReady) {
+    printError("SD card not ready");
+    return;
+  }
+  
+  if (currentState == STATE_RECORDING) {
+    Serial.println("Already recording");
+    return;
+  }
+  
+  // Generate filename
+  currentFileName = "/recordings/rec_" + String(recordingNumber) + ".wav";
+  Serial.println("Starting recording: " + currentFileName);
+  
+  // Create and open file
+  audioFile = SD.open(currentFileName, FILE_WRITE);
+  if (!audioFile) {
+    printError("Failed to create file");
+    return;
+  }
+  
+  // Write placeholder WAV header (will update later)
+  writeWAVHeader(audioFile, 0);
+  
+  // Clear I2S buffer
+  i2s_zero_dma_buffer(I2S_MIC_PORT);
+  
+  currentState = STATE_RECORDING;
+  recordStartTime = millis();
+  recordingNumber++;
+  
+  Serial.println("Recording started");
+  ledOn();
+}
+
+// ===== Stop Recording =====
+void stopRecording() {
+  if (currentState != STATE_RECORDING) {
+    return;
+  }
+  
+  Serial.println("Stopping recording...");
+  
+  // Get file size and update WAV header
+  uint32_t fileSize = audioFile.size();
+  uint32_t dataSize = fileSize - WAV_HEADER_SIZE;
+  
+  audioFile.seek(0);
+  writeWAVHeader(audioFile, dataSize);
+  audioFile.close();
+  
+  currentState = STATE_IDLE;
+  
+  Serial.printf("Recording saved: %s (%.2f seconds)\n", 
+                currentFileName.c_str(), 
+                (float)dataSize / (SAMPLE_RATE * 2));
+  
+  ledBlink(2, 200);
+}
+
+// ===== Start Playback =====
+void startPlayback() {
+  if (!sdCardReady) {
+    printError("SD card not ready");
+    return;
+  }
+  
+  if (currentState == STATE_PLAYING) {
+    Serial.println("Already playing");
+    return;
+  }
+  
+  // Find last recording
+  String lastFile = "";
+  int lastNum = 0;
+  File root = SD.open("/recordings");
+  while (File file = root.openNextFile()) {
+    String name = file.name();
+    if (name.startsWith("rec_") && name.endsWith(".wav")) {
+      int num = name.substring(4, name.length() - 4).toInt();
+      if (num > lastNum) {
+        lastNum = num;
+        lastFile = "/recordings/" + name;
+      }
+    }
+    file.close();
+  }
+  root.close();
+  
+  if (lastFile == "") {
+    printError("No recordings found");
+    ledBlink(3, 100);
+    return;
+  }
+  
+  currentFileName = lastFile;
+  Serial.println("Playing: " + currentFileName);
+  
+  // Open file
+  audioFile = SD.open(currentFileName, FILE_READ);
+  if (!audioFile) {
+    printError("Failed to open file");
+    return;
+  }
+  
+  // Skip WAV header
+  audioFile.seek(WAV_HEADER_SIZE);
+  
+  // Setup speaker
+  setupI2SSpeaker();
+  
+  currentState = STATE_PLAYING;
+  Serial.println("Playback started");
+}
+
+// ===== Stop Playback =====
+void stopPlayback() {
+  if (currentState != STATE_PLAYING) {
+    return;
+  }
+  
+  Serial.println("Stopping playback...");
+  
+  audioFile.close();
+  shutdownI2SSpeaker();
+  
+  currentState = STATE_IDLE;
+  Serial.println("Playback stopped");
+  ledOff();
+}
+
+// ===== Record Audio Task =====
+void recordAudioTask() {
+  size_t bytesRead = 0;
+  
+  // Read from microphone
+  esp_err_t result = i2s_read(I2S_MIC_PORT, audioBuffer, 
+                              BUFFER_SIZE * sizeof(int16_t), 
+                              &bytesRead, portMAX_DELAY);
+  
+  if (result == ESP_OK && bytesRead > 0) {
+    // Write to SD card
+    size_t bytesWritten = audioFile.write((uint8_t*)audioBuffer, bytesRead);
+    
+    if (bytesWritten != bytesRead) {
+      printError("Write error");
+      stopRecording();
+    }
+  }
+}
+
+// ===== Play Audio Task =====
+void playAudioTask() {
+  size_t bytesRead = audioFile.read((uint8_t*)audioBuffer, BUFFER_SIZE * sizeof(int16_t));
+  
+  if (bytesRead > 0) {
+    size_t bytesWritten = 0;
+    i2s_write(I2S_SPK_PORT, audioBuffer, bytesRead, &bytesWritten, portMAX_DELAY);
+  } else {
+    // End of file
+    Serial.println("Playback finished");
+    stopPlayback();
+  }
+}
+
+// ===== Write WAV Header =====
+void writeWAVHeader(File& file, uint32_t dataSize) {
+  WAVHeader header;
+  
+  header.byteRate = SAMPLE_RATE * I2S_CHANNELS * (SAMPLE_BITS / 8);
+  header.blockAlign = I2S_CHANNELS * (SAMPLE_BITS / 8);
+  header.dataSize = dataSize;
+  header.fileSize = dataSize + WAV_HEADER_SIZE - 8;
+  
+  file.write((uint8_t*)&header, sizeof(WAVHeader));
+}
+
+// ===== Button Handler =====
+void handleButtons() {
+  static unsigned long lastDebounce = 0;
+  static const unsigned long debounceDelay = 200;
+  
+  if (millis() - lastDebounce < debounceDelay) {
+    return;
+  }
+  
+  // Start button
+  if (digitalRead(BTN_START) == LOW) {
+    lastDebounce = millis();
+    if (currentState == STATE_IDLE) {
+      startRecording();
+    }
+  }
+  
+  // Stop button
+  if (digitalRead(BTN_STOP) == LOW) {
+    lastDebounce = millis();
+    if (currentState == STATE_RECORDING) {
+      stopRecording();
+    } else if (currentState == STATE_PLAYING) {
+      stopPlayback();
+    }
+  }
+  
+  // Play button
+  if (digitalRead(BTN_PLAY) == LOW) {
+    lastDebounce = millis();
+    if (currentState == STATE_IDLE) {
+      startPlayback();
+    }
+  }
+}
+
+// ===== Error Handler =====
+void printError(const char* message) {
+  Serial.print("ERROR: ");
+  Serial.println(message);
+  ledBlink(5, 100);
+}
